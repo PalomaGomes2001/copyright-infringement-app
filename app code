@@ -1,0 +1,395 @@
+import os
+import logging
+import difflib
+import hashlib
+import json
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime
+import librosa
+import music21
+import numpy as np
+from cryptography.fernet import Fernet
+from typing import Dict, Any
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# File configuration
+ALLOWED_EXTENSIONS = {'txt', 'xml', 'mxl', 'midi', 'mid', 'mp3', 'wav'}
+DATA_FOLDER = os.path.join(os.path.expanduser("~"), ".copyright_checker")
+os.makedirs(DATA_FOLDER, exist_ok=True)
+
+# Encryption setup
+KEY_FILE = os.path.join(DATA_FOLDER, "key.bin")
+if os.path.exists(KEY_FILE):
+    with open(KEY_FILE, "rb") as f:
+        ENCRYPTION_KEY = f.read()
+else:
+    ENCRYPTION_KEY = Fernet.generate_key()
+    with open(KEY_FILE, "wb") as f:
+        f.write(ENCRYPTION_KEY)
+fernet = Fernet(ENCRYPTION_KEY)
+
+class User:
+    def __init__(self, username: str, password_hash: str, email: str):
+        self.username = username
+        self.password_hash = password_hash
+        self.email = email
+
+class FileMetadata:
+    def __init__(self, filename: str, file_type: str, checksum: str, 
+                 encrypted_content: bytes, username: str, results: Dict):
+        self.filename = filename
+        self.file_type = file_type
+        self.checksum = checksum
+        self.encrypted_content = encrypted_content
+        self.username = username
+        self.results = results
+        self.created_at = datetime.utcnow().isoformat()
+
+class CopyrightCheckerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Copyright Checker")
+        self.root.geometry("800x600")
+        
+        # Initialize data storage
+        self.users_file = os.path.join(DATA_FOLDER, "users.json")
+        self.files_file = os.path.join(DATA_FOLDER, "files.json")
+        self.current_user = None
+        
+        self.load_data()
+        self.setup_ui()
+        
+    def load_data(self):
+        # Load users
+        if os.path.exists(self.users_file):
+            with open(self.users_file, 'r') as f:
+                self.users = json.load(f)
+        else:
+            self.users = {}
+            
+        # Load files
+        if os.path.exists(self.files_file):
+            with open(self.files_file, 'r') as f:
+                self.files = json.load(f)
+        else:
+            self.files = {}
+    
+    def save_data(self):
+        with open(self.users_file, 'w') as f:
+            json.dump(self.users, f)
+        with open(self.files_file, 'w') as f:
+            json.dump(self.files, f)
+    
+    def setup_ui(self):
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(expand=True, fill='both', padx=10, pady=5)
+        
+        # Login frame
+        self.login_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.login_frame, text='Login')
+        self.setup_login_ui()
+        
+        # Register frame
+        self.register_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.register_frame, text='Register')
+        self.setup_register_ui()
+        
+        # Main frame (initially hidden)
+        self.main_frame = ttk.Frame(self.notebook)
+        
+    def setup_login_ui(self):
+        # Login UI elements
+        ttk.Label(self.login_frame, text="Username:").pack(pady=5)
+        self.login_username = ttk.Entry(self.login_frame)
+        self.login_username.pack(pady=5)
+        
+        ttk.Label(self.login_frame, text="Password:").pack(pady=5)
+        self.login_password = ttk.Entry(self.login_frame, show="*")
+        self.login_password.pack(pady=5)
+        
+        ttk.Button(self.login_frame, text="Login", 
+                  command=self.handle_login).pack(pady=20)
+    
+    def setup_register_ui(self):
+        # Register UI elements
+        ttk.Label(self.register_frame, text="Username:").pack(pady=5)
+        self.reg_username = ttk.Entry(self.register_frame)
+        self.reg_username.pack(pady=5)
+        
+        ttk.Label(self.register_frame, text="Email:").pack(pady=5)
+        self.reg_email = ttk.Entry(self.register_frame)
+        self.reg_email.pack(pady=5)
+        
+        ttk.Label(self.register_frame, text="Password:").pack(pady=5)
+        self.reg_password = ttk.Entry(self.register_frame, show="*")
+        self.reg_password.pack(pady=5)
+        
+        ttk.Button(self.register_frame, text="Register", 
+                  command=self.handle_register).pack(pady=20)
+    
+    def setup_main_ui(self):
+        self.notebook.hide(0)  # Hide login tab
+        self.notebook.hide(1)  # Hide register tab
+        self.notebook.add(self.main_frame, text='Copyright Checker')
+        
+        # File upload section
+        upload_frame = ttk.LabelFrame(self.main_frame, text="Upload File")
+        upload_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(upload_frame, text="Choose File", 
+                  command=self.handle_file_upload).pack(pady=10)
+        
+        # Results section
+        self.results_frame = ttk.LabelFrame(self.main_frame, text="Analysis Results")
+        self.results_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # History section
+        history_frame = ttk.LabelFrame(self.main_frame, text="Analysis History")
+        history_frame.pack(fill='x', padx=10, pady=5)
+        
+        self.history_tree = ttk.Treeview(history_frame, columns=('File', 'Type', 'Date', 'Similarity'),
+                                       show='headings')
+        self.history_tree.heading('File', text='File Name')
+        self.history_tree.heading('Type', text='Type')
+        self.history_tree.heading('Date', text='Date')
+        self.history_tree.heading('Similarity', text='Max Similarity')
+        self.history_tree.pack(fill='x', pady=5)
+        
+        # Logout button
+        ttk.Button(self.main_frame, text="Logout", 
+                  command=self.handle_logout).pack(pady=5)
+        
+        self.update_history()
+    
+    def handle_login(self):
+        username = self.login_username.get()
+        password = self.login_password.get()
+        
+        if username in self.users:
+            stored_hash = self.users[username]['password_hash']
+            if hashlib.sha256(password.encode()).hexdigest() == stored_hash:
+                self.current_user = username
+                messagebox.showinfo("Success", "Login successful!")
+                self.setup_main_ui()
+                return
+        
+        messagebox.showerror("Error", "Invalid username or password")
+
+    def handle_register(self):
+        username = self.reg_username.get()
+        email = self.reg_email.get()
+        password = self.reg_password.get()
+        
+        if username in self.users:
+            messagebox.showerror("Error", "Username already exists")
+            return
+        
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        self.users[username] = {
+            'email': email,
+            'password_hash': password_hash
+        }
+        self.save_data()
+        messagebox.showinfo("Success", "Registration successful!")
+        self.notebook.select(0)  # Switch to login tab
+    
+    def handle_logout(self):
+        self.current_user = None
+        self.notebook.forget(self.notebook.select())
+        self.notebook.add(self.login_frame, text='Login')
+        self.notebook.add(self.register_frame, text='Register')
+        self.notebook.select(0)
+    
+    def handle_file_upload(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[
+                ('Text files', '*.txt'),
+                ('Music scores', '*.xml;*.mxl;*.midi;*.mid'),
+                ('Audio files', '*.mp3;*.wav')
+            ]
+        )
+        
+        if not file_path:
+            return
+            
+        filename = os.path.basename(file_path)
+        file_type = filename.rsplit('.', 1)[1].lower()
+        
+        if file_type not in ALLOWED_EXTENSIONS:
+            messagebox.showerror("Error", "Invalid file type")
+            return
+        
+        try:
+            # Read and process file
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+            
+            # Process based on file type
+            if file_type == 'txt':
+                similarity_data = self.process_lyrics(file_path)
+                analysis_type = 'lyrics'
+            elif file_type in ['xml', 'mxl', 'midi', 'mid']:
+                similarity_data = self.process_score(file_path)
+                analysis_type = 'score'
+            elif file_type in ['mp3', 'wav']:
+                similarity_data = self.process_audio(file_path)
+                analysis_type = 'audio'
+            
+            # Store file metadata
+            checksum = hashlib.sha256(file_content).hexdigest()
+            encrypted_content = fernet.encrypt(file_content)
+            
+            if self.current_user not in self.files:
+                self.files[self.current_user] = []
+            
+            file_metadata = {
+                'filename': filename,
+                'file_type': file_type,
+                'checksum': checksum,
+                'encrypted_content': encrypted_content.decode(),  # Convert bytes to string for JSON
+                'created_at': datetime.utcnow().isoformat(),
+                'results': similarity_data
+            }
+            
+            self.files[self.current_user].append(file_metadata)
+            self.save_data()
+            
+            # Show results
+            self.show_results(similarity_data, analysis_type)
+            self.update_history()
+            
+        except Exception as e:
+            logger.error(f"Error processing file: {str(e)}")
+            messagebox.showerror("Error", "Error processing file")
+    
+    def show_results(self, similarity_data, analysis_type):
+        # Clear previous results
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+        
+        # Display results
+        ttk.Label(self.results_frame, 
+                 text=f"Analysis Type: {analysis_type.title()}").pack(pady=5)
+        ttk.Label(self.results_frame, 
+                 text=f"Maximum Similarity: {similarity_data['max_similarity']}%").pack(pady=5)
+        ttk.Label(self.results_frame, 
+                 text=f"Average Similarity: {similarity_data['average_similarity']}%").pack(pady=5)
+        
+        # Create bar chart
+        fig, ax = plt.subplots(figsize=(6, 4))
+        scores = similarity_data['similarity_scores']
+        ax.bar(range(len(scores)), scores, 
+               color=['green' if s <= 30 else 'yellow' if s <= 70 else 'red' for s in scores])
+        ax.set_ylabel('Similarity (%)')
+        ax.set_xlabel('Sample Index')
+        ax.set_title('Similarity Scores')
+        
+        canvas = FigureCanvasTkAgg(fig, master=self.results_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True, pady=10)
+    
+    def update_history(self):
+        # Clear existing items
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        
+        # Add user's files to history
+        if self.current_user in self.files:
+            for file_data in sorted(self.files[self.current_user], 
+                                  key=lambda x: x['created_at'], reverse=True):
+                self.history_tree.insert('', 'end', values=(
+                    file_data['filename'],
+                    file_data['file_type'],
+                    datetime.fromisoformat(file_data['created_at']).strftime('%Y-%m-%d %H:%M'),
+                    f"{file_data['results']['max_similarity']}%"
+                ))
+    
+    def process_lyrics(self, filepath: str) -> Dict[str, Any]:
+        """Process lyrics file and return similarity metrics"""
+        with open(filepath, 'r', encoding='utf-8') as file:
+            input_lyrics = file.read().lower()
+        
+        known_lyrics = [
+            "Sample lyrics 1",
+            "Sample lyrics 2"
+        ]
+        
+        similarities = []
+        for known_text in known_lyrics:
+            similarity = difflib.SequenceMatcher(None, input_lyrics, known_text.lower()).ratio()
+            similarities.append(round(similarity * 100, 2))
+        
+        return {
+            'similarity_scores': similarities,
+            'max_similarity': max(similarities),
+            'average_similarity': sum(similarities) / len(similarities)
+        }
+    
+    def process_score(self, filepath: str) -> Dict[str, Any]:
+        """Process musical score and return similarity metrics"""
+        try:
+            score = music21.converter.parse(filepath)
+            notes = [str(n.pitch) for n in score.flat.notes]
+            
+            known_melodies = [
+                ["C4", "D4", "E4"],
+                ["G4", "A4", "B4"]
+            ]
+            
+            similarities = []
+            for melody in known_melodies:
+                similarity = difflib.SequenceMatcher(None, notes, melody).ratio()
+                similarities.append(round(similarity * 100, 2))
+            
+            return {
+                'similarity_scores': similarities,
+                'max_similarity': max(similarities),
+                'average_similarity': sum(similarities) / len(similarities)
+            }
+        except Exception as e:
+            raise Exception(f"Error processing score: {str(e)}")
+    
+    def process_audio(self, filepath: str) -> Dict[str, Any]:
+        """Process audio file and return similarity metrics"""
+        try:
+            y, sr = librosa.load(filepath)
+            
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr)
+            
+            known_features = [
+                {'tempo': 120, 'chroma': np.random.rand(12, 100), 'mfcc': np.random.rand(20, 100)},
+                {'tempo': 140, 'chroma': np.random.rand(12, 100), 'mfcc': np.random.rand(20, 100)}
+            ]
+            
+            similarities = []
+            for features in known_features:
+                tempo_sim = 1 - abs(tempo - features['tempo']) / max(tempo, features['tempo'])
+                chroma_sim = np.corrcoef(chroma.flatten(), features['chroma'].flatten())[0, 1]
+                mfcc_sim = np.corrcoef(mfcc.flatten(), features['mfcc'].flatten())[0, 1]
+                similarity = (tempo_sim + chroma_sim + mfcc_sim) / 3
+                similarities.append(round(similarity * 100, 2))
+            
+            return {
+                'similarity_scores': similarities,
+                'max_similarity': max(similarities),
+                'average_similarity': sum(similarities) / len(similarities)
+            }
+        except Exception as e:
+            raise Exception(f"Error processing audio: {str(e)}")
+
+def main():
+    root = tk.Tk()
+    app = CopyrightCheckerApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
